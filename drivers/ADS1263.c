@@ -28,6 +28,7 @@
 #
 ******************************************************************************/
 #include "ADS1263.h"
+#include <unistd.h>
 
 UBYTE ScanMode = 0;
 
@@ -54,9 +55,7 @@ Info:
 ******************************************************************************/
 static void ADS1263_WriteCmd(UBYTE Cmd)
 {
-    DEV_Digital_Write(DEV_CS_PIN, 0);
-    DEV_SPI_WriteByte(Cmd);
-    DEV_Digital_Write(DEV_CS_PIN, 1);
+    DEV_SPI_Transfer(&Cmd, NULL, 1);
 }
 
 /******************************************************************************
@@ -68,11 +67,8 @@ Info:
 ******************************************************************************/
 static void ADS1263_WriteReg(UBYTE Reg, UBYTE data)
 {
-    DEV_Digital_Write(DEV_CS_PIN, 0);
-    DEV_SPI_WriteByte(CMD_WREG | Reg);
-    DEV_SPI_WriteByte(0x00);
-    DEV_SPI_WriteByte(data);
-    DEV_Digital_Write(DEV_CS_PIN, 1);
+    UBYTE tx[3] = { (UBYTE)(CMD_WREG | Reg), 0x00, data };
+    DEV_SPI_Transfer(tx, NULL, sizeof(tx));
 }
 
 /******************************************************************************
@@ -84,14 +80,11 @@ Info:
 ******************************************************************************/
 static UBYTE ADS1263_Read_data(UBYTE Reg)
 {
-    UBYTE temp = 0;
-    DEV_Digital_Write(DEV_CS_PIN, 0);
-    DEV_SPI_WriteByte(CMD_RREG | Reg);
-    DEV_SPI_WriteByte(0x00);
-    // DEV_Delay_ms(1);
-    temp = DEV_SPI_ReadByte();
-    DEV_Digital_Write(DEV_CS_PIN, 1);
-    return temp;
+    UBYTE tx[3] = { (UBYTE)(CMD_RREG | Reg), 0x00, 0x00 };
+    UBYTE rx[3] = { 0, 0, 0 };
+    if (DEV_SPI_Transfer(tx, rx, sizeof(tx)) != 0)
+        return 0;
+    return rx[2];
 }
 
 /******************************************************************************
@@ -121,19 +114,17 @@ parameter:
 Info:
     Timeout indicates that the operation is not working properly.
 ******************************************************************************/
-static void ADS1263_WaitDRDY(void)
+/* Original code never incremented its loop counter, so a missing/unpowered
+ * ADC hung the program forever. Now a real time-based timeout. */
+static int ADS1263_WaitDRDY(void)
 {
-    // printf("ADS1263_WaitDRDY \r\n");
-    UDOUBLE i = 0;
-    while(1) {
-        if(DEV_Digital_Read(DEV_DRDY_PIN) == 0)
-            break;
-        if(i >= 4000000) {
-            printf("Time Out ...\r\n"); 
-            break;
-        }
-    }   
-    // printf("ADS1263_WaitDRDY Release \r\n");
+    uint64_t start = DEV_Millis();
+    while (DEV_Digital_Read(DEV_DRDY_PIN) != 0) {
+        if (DEV_Millis() - start >= ADS1263_DRDY_TIMEOUT_MS)
+            return ADS1263_ERR_TIMEOUT;
+        usleep(50);
+    }
+    return ADS1263_OK;
 }
 
 /******************************************************************************
@@ -318,6 +309,7 @@ Info:
 void ADS1263_SetDiffChannal(UBYTE Channal)
 {
     UBYTE INPMUX;
+    if (Channal > 4) return;
     if (Channal == 0) {
         INPMUX = (0<<4) | 1;    //DiffChannal   AIN0-AIN1
     } else if(Channal == 1) {
@@ -346,6 +338,7 @@ Info:
 void ADS1263_SetDiffChannal_ADC2(UBYTE Channal)
 {
     UBYTE INPMUX;
+    if (Channal > 4) return;
     if (Channal == 0) {
         INPMUX = (0<<4) | 1;    //DiffChannal   AIN0-AIN1
     } else if(Channal == 1) {
@@ -370,131 +363,98 @@ function:  Read ADC data
 parameter: 
 Info:
 ******************************************************************************/
-static UDOUBLE ADS1263_Read_ADC1_Data(void)
+/* One SPI transaction: RDATA1 + STATUS + 4 data bytes + CRC.
+ * Retries a few times if the "new data" bit is not set yet.
+ * Original code looped forever and only printed on CRC errors. */
+static int ADS1263_Read_ADC1_Data(UDOUBLE *out)
 {
-    UDOUBLE read = 0;
-    UBYTE buf[4] = {0, 0, 0, 0};
-    UBYTE Status, CRC;
-    DEV_Digital_Write(DEV_CS_PIN, 0);
-    do {
-        DEV_SPI_WriteByte(CMD_RDATA1);
-        // DEV_Delay_ms(10);
-        Status = DEV_SPI_ReadByte();
-    }while((Status & 0x40) == 0);
-    
-    buf[0] = DEV_SPI_ReadByte();
-    buf[1] = DEV_SPI_ReadByte();
-    buf[2] = DEV_SPI_ReadByte();
-    buf[3] = DEV_SPI_ReadByte();
-    CRC = DEV_SPI_ReadByte();
-    DEV_Digital_Write(DEV_CS_PIN, 1);
-    read |= ((UDOUBLE)buf[0] << 24);
-    read |= ((UDOUBLE)buf[1] << 16);
-    read |= ((UDOUBLE)buf[2] << 8);
-    read |= (UDOUBLE)buf[3];
-    // printf("%x %x %x %x %x %x\r\n", Status, buf[0], buf[1], buf[2], buf[3], CRC);
-    if(ADS1263_Checksum(read, CRC) != 0)
-        printf("ADC1 Data read error! \r\n");
-    return read;
+    for (int attempt = 0; attempt < 3; attempt++) {
+        UBYTE tx[7] = { CMD_RDATA1, 0, 0, 0, 0, 0, 0 };
+        UBYTE rx[7] = { 0 };
+        if (DEV_SPI_Transfer(tx, rx, sizeof(tx)) != 0)
+            return ADS1263_ERR_SPI;
+        UBYTE Status = rx[1];
+        if ((Status & 0x40) == 0) {   /* ADC1 new data not ready yet */
+            usleep(200);
+            continue;
+        }
+        UDOUBLE read = ((UDOUBLE)rx[2] << 24) | ((UDOUBLE)rx[3] << 16) |
+                       ((UDOUBLE)rx[4] << 8)  |  (UDOUBLE)rx[5];
+        if (ADS1263_Checksum(read, rx[6]) != 0)
+            return ADS1263_ERR_CRC;
+        *out = read;
+        return ADS1263_OK;
+    }
+    return ADS1263_ERR_NOT_READY;
+}
+
+static int ADS1263_Read_ADC2_Data(UDOUBLE *out)
+{
+    for (int attempt = 0; attempt < 3; attempt++) {
+        UBYTE tx[7] = { CMD_RDATA2, 0, 0, 0, 0, 0, 0 };
+        UBYTE rx[7] = { 0 };
+        if (DEV_SPI_Transfer(tx, rx, sizeof(tx)) != 0)
+            return ADS1263_ERR_SPI;
+        if ((rx[1] & 0x80) == 0) {
+            usleep(200);
+            continue;
+        }
+        /* ADC2: 3 data bytes + pad byte, then CRC */
+        UDOUBLE read = ((UDOUBLE)rx[2] << 16) | ((UDOUBLE)rx[3] << 8) | (UDOUBLE)rx[4];
+        if (ADS1263_Checksum(read, rx[6]) != 0)
+            return ADS1263_ERR_CRC;
+        *out = read;
+        return ADS1263_OK;
+    }
+    return ADS1263_ERR_NOT_READY;
 }
 
 /******************************************************************************
-function:  Read ADC data
-parameter: 
-Info:
+function:  Read one ADC1 conversion from a channel
+parameter: Channel (0-10 single-ended vs AINCOM, 0-4 differential)
+           out    : raw 32-bit two's complement code
+return:    ADS1263_OK or a negative ADS1263_ERR_* code
 ******************************************************************************/
-static UDOUBLE ADS1263_Read_ADC2_Data(void)
+int ADS1263_ReadADC1(UBYTE Channel, UDOUBLE *out)
 {
-    UDOUBLE read = 0;
-    UBYTE buf[4] = {0, 0, 0, 0};
-    UBYTE Status, CRC;
-    
-    DEV_Digital_Write(DEV_CS_PIN, 0);
-    do {
-        DEV_SPI_WriteByte(CMD_RDATA2);
-        // DEV_Delay_ms(10);
-        Status = DEV_SPI_ReadByte();
-    }while((Status & 0x80) == 0);
-    
-    buf[0] = DEV_SPI_ReadByte();
-    buf[1] = DEV_SPI_ReadByte();
-    buf[2] = DEV_SPI_ReadByte();
-    buf[3] = DEV_SPI_ReadByte();
-    CRC = DEV_SPI_ReadByte();
-    DEV_Digital_Write(DEV_CS_PIN, 1);
-    read |= ((UDOUBLE)buf[0] << 16);
-    read |= ((UDOUBLE)buf[1] << 8);
-    read |= (UDOUBLE)buf[2];
-    // printf("%x %x %x %x %x\r\n", Status, buf[0], buf[1], buf[2], CRC);
-    if(ADS1263_Checksum(read, CRC) != 0)
-        printf("ADC2 Data read error! \r\n");
-    return read;
+    if (out == NULL) return ADS1263_ERR_ARG;
+    if (ScanMode == 0) {
+        if (Channel > 10) return ADS1263_ERR_ARG;
+        ADS1263_SetChannal(Channel);
+    } else {
+        if (Channel > 4) return ADS1263_ERR_ARG;
+        ADS1263_SetDiffChannal(Channel);
+    }
+    int rc = ADS1263_WaitDRDY();
+    if (rc != ADS1263_OK) return rc;
+    return ADS1263_Read_ADC1_Data(out);
 }
 
-/******************************************************************************
-function:  Read ADC specified channel data
-parameter: 
-    Channel: Channel number
-Info:
-******************************************************************************/
+int ADS1263_ReadADC2(UBYTE Channel, UDOUBLE *out)
+{
+    if (out == NULL) return ADS1263_ERR_ARG;
+    if (ScanMode == 0) {
+        if (Channel > 10) return ADS1263_ERR_ARG;
+        ADS1263_SetChannal_ADC2(Channel);
+    } else {
+        if (Channel > 4) return ADS1263_ERR_ARG;
+        ADS1263_SetDiffChannal_ADC2(Channel);
+    }
+    ADS1263_WriteCmd(CMD_START2);
+    return ADS1263_Read_ADC2_Data(out);
+}
+
+/* Legacy Waveshare API: returns 0 on any error. Prefer ADS1263_ReadADC1(). */
 UDOUBLE ADS1263_GetChannalValue(UBYTE Channel)
 {
-    UDOUBLE Value = 0;
-    if(ScanMode == 0) {// 0  Single-ended input  10 channel1 Differential input  5 channe 
-        if(Channel>10) {
-            return 0;
-        }
-        ADS1263_SetChannal(Channel);
-        // DEV_Delay_ms(2);
-        // ADS1263_WriteCmd(CMD_START1);
-        // DEV_Delay_ms(2);
-        ADS1263_WaitDRDY();
-        Value = ADS1263_Read_ADC1_Data();
-    } else {
-        if(Channel>4) {
-            return 0;
-        }
-        ADS1263_SetDiffChannal(Channel);
-        // DEV_Delay_ms(2);
-        // ADS1263_WriteCmd(CMD_START1);
-        // DEV_Delay_ms(2);
-        ADS1263_WaitDRDY();
-        Value = ADS1263_Read_ADC1_Data();
-    }
-    // printf("Get IN%d value success \r\n", Channel);
-    return Value;
+    UDOUBLE v = 0;
+    return ADS1263_ReadADC1(Channel, &v) == ADS1263_OK ? v : 0;
 }
 
-/******************************************************************************
-function:  Read ADC specified channel data
-parameter: 
-    Channel: Channel number
-Info:
-******************************************************************************/
 UDOUBLE ADS1263_GetChannalValue_ADC2(UBYTE Channel)
 {
-    UDOUBLE Value = 0;
-    if(ScanMode == 0) {// 0  Single-ended input  10 channel1 Differential input  5 channe 
-        if(Channel>10) {
-            return 0;
-        }
-        ADS1263_SetChannal_ADC2(Channel);
-        // DEV_Delay_ms(2);
-        ADS1263_WriteCmd(CMD_START2);
-        // DEV_Delay_ms(2);
-        Value = ADS1263_Read_ADC2_Data();
-    } else {
-        if(Channel>4) {
-            return 0;
-        }
-        ADS1263_SetDiffChannal_ADC2(Channel);
-        // DEV_Delay_ms(2);
-        ADS1263_WriteCmd(CMD_START2);
-        // DEV_Delay_ms(2);
-        Value = ADS1263_Read_ADC2_Data();
-    }
-    // printf("Get IN%d value success \r\n", Channel);
-    return Value;
+    UDOUBLE v = 0;
+    return ADS1263_ReadADC2(Channel, &v) == ADS1263_OK ? v : 0;
 }
 
 /******************************************************************************
@@ -574,8 +534,9 @@ UDOUBLE ADS1263_RTD(ADS1263_DELAY delay, ADS1263_GAIN gain, ADS1263_DRATE drate)
     //Read one conversion
     ADS1263_WriteCmd(CMD_START1);
     DEV_Delay_ms(10);
-    ADS1263_WaitDRDY();
-    Value = ADS1263_Read_ADC1_Data();
+    Value = 0;
+    if (ADS1263_WaitDRDY() == ADS1263_OK)
+        ADS1263_Read_ADC1_Data(&Value);
     ADS1263_WriteCmd(CMD_STOP1);
 
     return Value;

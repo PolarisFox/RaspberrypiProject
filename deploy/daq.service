@@ -1,0 +1,25 @@
+# /etc/systemd/system/daq.service
+#   sudo cp deploy/daq.service /etc/systemd/system/ && sudo systemctl daemon-reload
+#   sudo systemctl enable --now daq
+#   journalctl -u daq -f
+[Unit]
+Description=CAN + ADS1263 DAQ logger (SQLite)
+After=network-online.target time-sync.target
+Wants=network-online.target time-sync.target
+
+[Service]
+Type=simple
+# CAN 인터페이스 설정 (이미 올라와 있으면 실패해도 무시: '-' 접두사)
+ExecStartPre=-/sbin/ip link set can0 down
+ExecStartPre=/sbin/ip link set can0 type can bitrate 125000
+ExecStartPre=/sbin/ip link set can0 up
+ExecStart=/opt/daq/daq -q -d /var/lib/daq/daq.db -i can0 -p 100 --vref 5.0
+StateDirectory=daq
+Restart=on-failure
+RestartSec=3
+# SIGTERM -> 큐에 남은 데이터를 DB에 기록하고 종료
+KillSignal=SIGTERM
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target

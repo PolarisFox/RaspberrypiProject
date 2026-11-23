@@ -182,6 +182,22 @@ typedef enum
     CMD_WREG2   = 0x00, // number of registers to write minus 1, 000n nnnn
 }ADS1263_CMD;
 
+/* Return codes for the checked read API */
+#define ADS1263_OK              0
+#define ADS1263_ERR_TIMEOUT    (-1)   /* DRDY never went low */
+#define ADS1263_ERR_CRC        (-2)   /* checksum mismatch (bus noise / SPI contention) */
+#define ADS1263_ERR_NOT_READY  (-3)   /* status byte never reported new data */
+#define ADS1263_ERR_SPI        (-4)
+#define ADS1263_ERR_ARG        (-5)
+
+#ifndef ADS1263_DRDY_TIMEOUT_MS
+#define ADS1263_DRDY_TIMEOUT_MS 50u   /* 400 SPS -> 2.5 ms/sample; 50 ms is generous */
+#endif
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 UBYTE ADS1263_init_ADC1(ADS1263_DRATE rate);
 UBYTE ADS1263_init_ADC2(ADS1263_ADC2_DRATE rate);
 void ADS1263_SetMode(UBYTE Mode);
@@ -190,4 +206,12 @@ void ADS1263_GetAll(UBYTE *List, UDOUBLE *Value, int Number);
 void ADS1263_GetAll_ADC2(UDOUBLE *ADC_Value);
 UDOUBLE ADS1263_RTD(ADS1263_DELAY delay, ADS1263_GAIN gain, ADS1263_DRATE drate);
 void ADS1263_DAC(ADS1263_DAC_VOLT volt, UBYTE isPositive, UBYTE isClose);
+
+int ADS1263_ReadADC1(UBYTE Channel, UDOUBLE *out);
+int ADS1263_ReadADC2(UBYTE Channel, UDOUBLE *out);
+UDOUBLE ADS1263_GetChannalValue_ADC2(UBYTE Channel);
+
+#ifdef __cplusplus
+}
+#endif
 #endif
